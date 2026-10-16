@@ -247,7 +247,7 @@ def after_sql(state: SQLState) -> str:
     return "stop"
 
 
-builder = StateGr9aph(SQLState)
+builder = StateGraph(SQLState)
 
 builder.add_node("skill_node", skill_node)
 builder.add_node("schema_node", schema_node)
