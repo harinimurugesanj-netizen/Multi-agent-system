@@ -1,0 +1,27 @@
+[project]
+name = "multi-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "harini", email = "harinimurugesanj@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "ddgs>=9.16.0",
+    "deepagents>=0.7.23",
+    "fastapi>=0.143.2",
+    "langchain>=1.4.6",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.15",
+    "psycopg[binary]>=3.3.6",
+    "sqlalchemy>=2.1.4",
+    "uvicorn>=0.54.0",
+]
+
+[project.scripts]
+multi-agent = "multi_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.23,<0.13.0"]
+build-backend = "uv_build"
