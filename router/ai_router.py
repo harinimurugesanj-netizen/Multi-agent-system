@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 ai_router = APIRouter()
 
-
 class QueryRequest(BaseModel):
     query: str
 

@@ -1,18 +1,10 @@
 import logging
-
-from sqlalchemy import create_engine, inspect, text
-from sqlalchemy.orm import sessionmaker
-
-logger = logging.getLogger(__name__)
-
-DATABASE_URL = "postgresql+psycopg://postgres:root@localhost:5432/fastapi"
-
-engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
-
+from sqlalchemy import inspect
+from sqlalchemy import inspect, text 
+from database.db_connection import engine, SessionLocal
 MAX_ROWS = 500
 
-
+logger = logging.getLogger(__name__)
 def get_schema_description() -> str:
     """Introspect the database and return table/column/foreign-key info as text."""
     inspector = inspect(engine)

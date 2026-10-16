@@ -13,8 +13,8 @@ from database import run_sql, get_schema_description
 
 logger = logging.getLogger(__name__)
 
-MAX_SQL_ATTEMPTS = 3          # SQL generate+execute attempts per request
-MAX_TOOL_TRIES = 2            # times a node re-asks its agent if it forgets to call its tool
+MAX_SQL_ATTEMPTS = 3          
+MAX_TOOL_TRIES = 2            
 MODEL = "ollama:llama3.1"
 
 SKILL_PATH = Path(__file__).parent / "skills" / "sql-operations" / "SKILL.md"
@@ -108,6 +108,13 @@ schema_agent = create_agent(
 
 SQL_AGENT_PROMPT = """You are a PostgreSQL expert.
 You are given SKILL INSTRUCTIONS, a DATABASE SCHEMA and a USER REQUEST.
+- Only use columns that belong to the specified table.
+- Before generating SQL, verify that every referenced column exists
+  in the table being queried.
+- If a filter refers to a column in another table, use a JOIN only
+  when the schema defines the appropriate relationship.
+- Never invent table names or column names.
+Follow the detailed SQL generation rules in the sql-operations skill.
 Follow the skill instructions exactly and use only the tables and columns in the schema.
 Write ONE SQL statement and call the execute_sql tool with it.
 Never answer without calling execute_sql. Do not invent database results."""
@@ -240,7 +247,7 @@ def after_sql(state: SQLState) -> str:
     return "stop"
 
 
-builder = StateGraph(SQLState)
+builder = StateGr9aph(SQLState)
 
 builder.add_node("skill_node", skill_node)
 builder.add_node("schema_node", schema_node)

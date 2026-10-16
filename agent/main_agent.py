@@ -14,20 +14,30 @@ MODEL = "ollama:llama3.1"
 
 
 @tool
-async def parallel_agents(query: str) -> str:
-    """Run the research and SQL agents concurrently when both are required."""
+async def parallel_agents(
+    research_query: str,
+    sql_query: str,
+) -> str:
+    """Run research and SQL agents concurrently with separate queries."""
 
     logger.info("Starting parallel research and SQL execution")
+    logger.info("Research query: %s", research_query)
+    logger.info("SQL query: %s", sql_query)
+    print(research_query,sql_query)
+    if not research_query.strip() or not sql_query.strip():
+        raise ValueError(
+            "Both research_query and sql_query must be provided."
+        )
 
     try:
         research_task = asyncio.to_thread(
             call_research_agent.invoke,
-            {"query": query},
+            {"query": research_query},
         )
 
         sql_task = asyncio.to_thread(
             call_sql_agent.invoke,
-            {"query": query},
+            {"query": sql_query},
         )
 
         research_result, sql_result = await asyncio.gather(
@@ -44,14 +54,12 @@ async def parallel_agents(query: str) -> str:
             logger.error("SQL agent failed: %s", sql_result)
             sql_result = "SQL agent execution failed."
 
-        results = {
+        logger.info("Parallel execution completed")
+
+        return json.dumps({
             "research_result": str(research_result),
             "sql_result": str(sql_result),
-        }
-
-        logger.info("Parallel research and SQL execution completed")
-
-        return json.dumps(results)
+        })
 
     except Exception:
         logger.exception("Parallel agent execution failed")
@@ -69,32 +77,31 @@ main_agent = create_agent(
         parallel_agents,
     ],
     system_prompt=(
-        "You are the main supervisor agent. Understand the user's intent "
-        "and choose the appropriate execution path.\n\n"
-
-        "TOOL SELECTION:\n"
-        "1. For greetings and general questions that require neither "
-        "research nor database access, answer directly.\n"
-        "2. For requests requiring only web research, call "
-        "call_research_agent.\n"
-        "3. For requests requiring only database operations, call "
-        "call_sql_agent.\n"
-        "4. For requests requiring both web research and database access, "
-        "call parallel_agents exactly once.\n\n"
-
-        "TOOL RULES:\n"
-        "Pass the user's original request to the selected tool. "
-        "When both agents are required, do not call the research and SQL "
-        "tools separately. Use parallel_agents. Never invent tool results "
-        "or claim an operation succeeded without evidence. "
-        "If SQL requires DELETE confirmation, do not claim the deletion "
-        "has already been executed.\n\n"
-
-        "FINAL RESPONSE:\n"
-        "After receiving the tool results, respond clearly and accurately."
-    ),
+    "You are the main supervisor agent. Analyze the user's request "
+    "and select the appropriate execution path.\n\n"
+    "RULES:\n"
+    "1. If the request requires neither research nor database access, "
+    "answer directly.\n\n"
+    "2. If only web research is required, call call_research_agent "
+    "with the research-specific query.\n\n"
+    "3. If only database access is required, call call_sql_agent "
+    "with the SQL-specific query.\n\n"
+    "4. If both research and database access are required:\n"
+    "- Separate the original request into two queries.\n"
+    "- Put the research task in research_query.\n"
+    "- Put the database task in sql_query.\n"
+    "- Call parallel_agents exactly once with both arguments.\n"
+    "- Never pass the original combined request to both agents.\n"
+    "- Never pass None or empty strings.\n"
+    "- Do not call the individual agents separately in this case.\n\n"
+    "5. Never call parallel_agents when only one task is required.\n\n"
+    "6. Never invent tool results or claim database operations "
+    "succeeded without evidence.\n\n"
+    "7. If SQL requires DELETE confirmation, do not claim that "
+    "the deletion has already been executed.\n\n"
+    "After receiving the results, provide a clear and accurate response."
+),
 )
-
 
 async def run_main_agent(query: str) -> dict:
     """Run the supervisor once and return its actual results."""

@@ -2,6 +2,17 @@
 name: sql-operations
 description: Write and run one PostgreSQL statement (SELECT, INSERT, UPDATE or DELETE) for the user's database request, using the exact table and column names from the supplied schema. Use for any request to show, find, list, count, add, change or delete database records.
 ---
+## SQL Data Type Rules
+
+- Read the database schema and check each column's data type before generating SQL.
+- Use ILIKE only for text columns such as VARCHAR and TEXT.
+- For DATE columns, use = for exact date comparisons and <, >, <=, or >= for date ranges.
+- Never use ILIKE on DATE, INTEGER, NUMERIC, or BOOLEAN columns.
+- For exact dates, use the YYYY-MM-DD format, such as '2002-05-15'.
+- Never use 'YYYY-MM-DD' as an actual date value; it is a format pattern.
+- For year-based searches, use EXTRACT(YEAR FROM "column_name") = year.
+- Use operators appropriate to the column's data type.
+- Never invent column names or data types; follow the provided database schema.
 
 # sql-operations
 
@@ -19,13 +30,6 @@ The DATABASE SCHEMA is supplied with every request. It is the only source of tru
 Never answer from memory or invent results. Never skip `execute_sql`.
 
 ## Choose the operation
-
-| The user says | Statement |
-|---|---|
-| show, get, find, list, display, count, how many, total, average | SELECT |
-| add, create, insert, register, new | INSERT |
-| change, update, set, edit, modify, rename | UPDATE |
-| remove, delete, drop a record | DELETE |
 
 Only generate SELECT, INSERT, UPDATE or DELETE. Never generate DROP, TRUNCATE, ALTER, CREATE, GRANT or REVOKE.
 
