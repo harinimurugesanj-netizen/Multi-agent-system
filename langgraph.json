@@ -1,0 +1,13 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "photoframe": "./app/studio.py:graph"
+  },
+  "env": ".env",
+  "checkpointer": {
+    "path": "./app/studio_persistence.py:generate_checkpointer"
+  },
+  "store": {
+    "path": "./app/studio_persistence.py:generate_store"
+  }
+}
