@@ -19,14 +19,14 @@ from app.classify import classify_message
 from app.constants import REQUIREMENT_FIELDS
 from app.errors import AppError, LLMUnavailable, safe_message_for
 from app.estimation import Estimation, calculate_estimation, validate_estimation
-from app.extraction import extract_from_message
+from app.extraction import extract_from_message, repair_from_message
 from app.formatting import (describe_items, fallback_response, fmt_money, quotation_text,
                             short_ref, verify_response)
 from config.logging_config import get_logger
 from app.questions import build_question
 from app.quotation_select import (choose_quotation, format_candidates, record_to_candidate,
                                   resolve_reply)
-from app.requirements import merge_requirements, validate_requirements
+from app.requirements import merge_requirements, validate_against_catalog
 from graphs.state import FRESH_REQUEST, QuotationState
 
 log = get_logger(__name__)
@@ -94,6 +94,10 @@ def make_nodes(deps, tools) -> dict[str, Any]:
         if err:
             return {**FRESH_REQUEST, **err}
 
+        catalog, err = _try_db(deps, lambda conn: repo.get_catalog(conn))
+        if err:
+            return {**FRESH_REQUEST, **err}
+
         summary = ""
         if store is not None:
             try:
@@ -103,14 +107,15 @@ def make_nodes(deps, tools) -> dict[str, Any]:
             except Exception:
                 log.warning("memory_load_failed", exc_info=True)
         return {**FRESH_REQUEST, "customer_id": cid, "thread_id": thread_id,
-                "run_id": uuid.uuid4().hex, "memory_summary": summary}
+                "run_id": uuid.uuid4().hex, "memory_summary": summary, "catalog": catalog}
 
     def classify_intent(state: QuotationState):
         try:
-            c = classify_message(deps.llm_json, _last_human_text(state))
+            c = classify_message(deps.llm_json, _last_human_text(state), state.get("catalog") or {})
         except LLMUnavailable as exc:
             return {"error_code": exc.code, "error": exc.detail}
-        return {"intent": c.intent, "requested_changes": c.requested, "quotation_reference": c.reference}
+        return {"intent": c.intent, "requested_changes": c.requested, "quotation_reference": c.reference,
+                "reference_latest": c.reference_latest}
 
     # ------------------------------------------------------------ general questions
     def general_agent(state: QuotationState):
@@ -137,7 +142,7 @@ def make_nodes(deps, tools) -> dict[str, Any]:
         if not records:
             return {"error_code": "quotation_not_found", "error": "no matching quotation"}
         cands = [record_to_candidate(r) for r in records]
-        return {"candidates": cands, "selected_quotation_id": choose_quotation(cands, _last_human_text(state))}
+        return {"candidates": cands, "selected_quotation_id": choose_quotation(cands, state.get("reference_latest", False))}
 
     def ask_which_quotation(state: QuotationState) -> Command[Literal["load_base_requirements", "ask_which_quotation", "respond_error"]]:
         attempts = state.get("clarification_attempts", 0)
@@ -148,7 +153,7 @@ def make_nodes(deps, tools) -> dict[str, Any]:
                     "Reply with its number:\n" + format_candidates(cands, cur))
         reply = _reply_text(interrupt({"type": "choose_quotation", "question": question}))
         msgs = [AIMessage(content=question), HumanMessage(content=reply)]
-        chosen = resolve_reply(cands, reply)
+        chosen = resolve_reply(deps.llm_json, cands, reply, cur)
         if chosen:
             return Command(update={"messages": msgs, "selected_quotation_id": chosen}, goto="load_base_requirements")
         return Command(update={"messages": msgs, "clarification_attempts": attempts + 1}, goto="ask_which_quotation")
@@ -190,22 +195,38 @@ def make_nodes(deps, tools) -> dict[str, Any]:
                                "clarification_attempts": attempts + 1}, goto="extract_requirements")
 
     def extract_requirements(state: QuotationState):
+        """Read the customer's reply (LLM) and merge it into the requirements."""
         text = _last_human_text(state)
         collected = {f: state.get(f) for f in REQUIREMENT_FIELDS}
         asked = list(state.get("missing_fields", [])) + list(state.get("invalid_fields", {}))
-        result = extract_from_message(deps.llm_json, text, collected, asked)
-        return {**merge_requirements(collected, result.fields), "error": None}
+        result = extract_from_message(deps.llm_json, text, state.get("catalog") or {}, asked)
+        return {**merge_requirements(collected, result.fields), "repair_attempts": 0, "error": None}
 
     def validate_requirements_node(state: QuotationState):
-        result = validate_requirements(state)
-        log.info("validate_node", thread_id=state.get("thread_id"), **result)
-        return result
+        """Validate the JSON against what the DATABASE offers (values and price combinations)."""
+        catalog, err = _try_db(deps, lambda conn: repo.get_catalog(conn))
+        if err:
+            return err
+        result = validate_against_catalog(state, catalog)
+        log.info("validate_node", thread_id=state.get("thread_id"), status=result["validation_status"],
+                 missing=result["missing_fields"], invalid=result["invalid_fields"])
+        return {**result, "catalog": catalog}
+
+    def repair_requirements(state: QuotationState):
+        """Send the validation problems back to the LLM so it can correct its JSON."""
+        current = {f: state.get(f) for f in REQUIREMENT_FIELDS}
+        result = repair_from_message(deps.llm_json, _last_human_text(state), current,
+                                     state.get("problems", []), state.get("catalog") or {})
+        log.info("repair_node", attempt=state.get("repair_attempts", 0) + 1, fixed=result.fields)
+        return {**merge_requirements(current, result.fields),
+                "repair_attempts": state.get("repair_attempts", 0) + 1}
 
     def ask_customer(state: QuotationState) -> Command[Literal["extract_requirements", "respond_error"]]:
         attempts = state.get("clarification_attempts", 0)
         if attempts >= deps.max_clarifications:
             return Command(update={"error_code": "too_many_clarifications"}, goto="respond_error")
-        question = build_question(state.get("missing_fields", []), state.get("invalid_fields", {}))
+        question = build_question(state.get("missing_fields", []), state.get("invalid_fields", {}),
+                                  state.get("problems", []), state.get("catalog") or {})
         reply = _reply_text(interrupt({"type": "clarification", "question": question,
                                        "missing_fields": state.get("missing_fields", []),
                                        "invalid_fields": state.get("invalid_fields", {})}))
@@ -304,6 +325,7 @@ def make_nodes(deps, tools) -> dict[str, Any]:
         "load_base_requirements": load_base_requirements, "present_history": present_history,
         "apply_requested": apply_requested, "ask_change_details": ask_change_details,
         "extract_requirements": extract_requirements, "validate_requirements": validate_requirements_node,
+        "repair_requirements": repair_requirements,
         "ask_customer": ask_customer, "fetch_prices": fetch_prices,
         "calculate_estimation": calculate_estimation_node, "validate_estimation": validate_estimation_node,
         "save_quotation": save_quotation, "save_memory": save_memory,

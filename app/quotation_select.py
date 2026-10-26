@@ -1,18 +1,19 @@
-"""Pure helpers for picking which previous quotation the customer means."""
+"""Helpers for picking which previous quotation the customer means (no word lists)."""
 import re
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, Optional
 
-from app.constants import REQUIREMENT_FIELDS
-from app.extraction import _found_in_text
+from app.extraction import parse_llm_json
 
-_RECENCY = re.compile(r"\b(previous|last|latest|recent|newest)\b", re.I)
 _ONLY_NUMBER = re.compile(r"^\W*(?:no\.?|number|option|#)?\s*(\d{1,2})\W*$", re.I)
 
-
-def has_recency_word(text: str) -> bool:
-    return bool(_RECENCY.search(text or ""))
+PICK_PROMPT = """
+The customer was asked which of their quotations they mean.
+Quotations (newest first):
+{list}
+Customer's reply: {reply}
+Reply with ONE JSON object: {"choice": <number of the quotation they mean, or null if it is unclear>}
+JSON:"""
 
 
 def record_to_candidate(rec) -> dict[str, Any]:
@@ -25,31 +26,13 @@ def record_to_candidate(rec) -> dict[str, Any]:
     }
 
 
-def choose_quotation(candidates: list[dict], text: str) -> Optional[str]:
-    """Automatic choice from the customer's first message, or None if ambiguous."""
+def choose_quotation(candidates: list[dict], latest: bool) -> Optional[str]:
+    """Automatic choice, or None if ambiguous. `latest` comes from the LLM (evidence-checked)."""
     if not candidates:
         return None
-    if len(candidates) == 1 or has_recency_word(text):
-        return candidates[0]["id"]          # candidates are newest-first
+    if len(candidates) == 1 or latest:
+        return candidates[0]["id"]            # candidates are newest-first
     return None
-
-
-def resolve_reply(candidates: list[dict], reply: str) -> Optional[str]:
-    """Interpret the customer's answer to 'which quotation?'. Conservative: None if unclear."""
-    m = _ONLY_NUMBER.match(reply or "")
-    if m:
-        idx = int(m.group(1))
-        return candidates[idx - 1]["id"] if 1 <= idx <= len(candidates) else None
-    if has_recency_word(reply):
-        return candidates[0]["id"]
-    matches = candidates
-    mentioned = False
-    for f in REQUIREMENT_FIELDS:
-        found = _found_in_text(f, reply or "")
-        if found:
-            mentioned = True
-            matches = [c for c in matches if c[f] in found]
-    return matches[0]["id"] if mentioned and len(matches) == 1 else None
 
 
 def format_candidates(candidates: list[dict], currency: str = "") -> str:
@@ -60,3 +43,21 @@ def format_candidates(candidates: list[dict], currency: str = "") -> str:
         lines.append(f"{i}. {describe_items(c['frame_size'], c['frame_material'], c['glass_type'])}"
                      f" - {fmt_money(c['selling_price'], currency)} ({day})")
     return "\n".join(lines)
+
+
+def resolve_reply(llm, candidates: list[dict], reply: str, currency: str = "") -> Optional[str]:
+    """A bare number is taken directly; anything else the LLM interprets, and its answer is
+    accepted only if it is a valid index into the list."""
+    m = _ONLY_NUMBER.match(reply or "")
+    if m:
+        idx = int(m.group(1))
+        return candidates[idx - 1]["id"] if 1 <= idx <= len(candidates) else None
+    prompt = (PICK_PROMPT.replace("{list}", format_candidates(candidates, currency))
+              .replace("{reply}", reply or ""))
+    try:
+        choice = parse_llm_json(llm.invoke(prompt).content).get("choice")
+    except Exception:
+        return None
+    if isinstance(choice, int) and not isinstance(choice, bool) and 1 <= choice <= len(candidates):
+        return candidates[choice - 1]["id"]
+    return None

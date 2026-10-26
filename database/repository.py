@@ -1,7 +1,12 @@
 """
- * every query is a fixed, parameterized statement (the LLM never writes SQL);
+ * every query is built from SQLAlchemy ORM models and is parameterized (the LLM never writes SQL);
  * every query touching quotations/threads is scoped by customer_id (authorization);
  * functions take an open Connection so callers control the transaction.
+
+The public API (function names, signatures, dataclasses) is identical to the raw-SQL version,
+so nodes.py, service.py and the tests do not change. The models below only MAP existing tables;
+schema.sql stays the source of truth for DDL, constraints and the immutability trigger
+(do not call Base.metadata.create_all()).
 """
 from __future__ import annotations
 
@@ -10,7 +15,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import Connection, text
+from sqlalchemy import BigInteger, Connection, DateTime, Integer, Numeric, Text, select
+from sqlalchemy.dialects.postgresql import UUID, insert as pg_insert
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from app.constants import PROFIT_MARGIN, WASTAGE_RATE
 from app.errors import PersistenceError, PricingNotFound, QuotationNotFound, UnauthorizedAccess
@@ -18,12 +25,72 @@ from config.logging_config import get_logger
 
 log = get_logger(__name__)
 
+
+# ---------------------------------------------------------------- models (mapping only)
+class Base(DeclarativeBase):
+    pass
+
+
+class FramePrice(Base):
+    __tablename__ = "frame_prices"
+    frame_size: Mapped[str] = mapped_column(Text, primary_key=True)
+    frame_material: Mapped[str] = mapped_column(Text, primary_key=True)
+    price: Mapped[Decimal] = mapped_column(Numeric)
+
+
+class GlassPrice(Base):
+    __tablename__ = "glass_prices"
+    frame_size: Mapped[str] = mapped_column(Text, primary_key=True)
+    glass_type: Mapped[str] = mapped_column(Text, primary_key=True)
+    price: Mapped[Decimal] = mapped_column(Numeric)
+
+
+class LabourPrice(Base):
+    __tablename__ = "labour_prices"
+    frame_size: Mapped[str] = mapped_column(Text, primary_key=True)
+    labour_cost: Mapped[Decimal] = mapped_column(Numeric)
+
+
+class Customer(Base):
+    __tablename__ = "customers"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    external_id: Mapped[str] = mapped_column(Text)
+    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class ConversationThread(Base):
+    __tablename__ = "conversation_threads"
+    thread_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Quotation(Base):
+    __tablename__ = "quotations"
+    id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
+    customer_id: Mapped[int] = mapped_column(BigInteger)
+    thread_id: Mapped[str] = mapped_column(Text)
+    original_quotation_id: Mapped[Optional[str]] = mapped_column(UUID(as_uuid=False), nullable=True)
+    revision_number: Mapped[int] = mapped_column(Integer)
+    frame_size: Mapped[str] = mapped_column(Text)
+    frame_material: Mapped[str] = mapped_column(Text)
+    glass_type: Mapped[str] = mapped_column(Text)
+    material_price: Mapped[Decimal] = mapped_column(Numeric)
+    glass_price: Mapped[Decimal] = mapped_column(Numeric)
+    labour_cost: Mapped[Decimal] = mapped_column(Numeric)
+    wastage_rate: Mapped[Decimal] = mapped_column(Numeric)
+    wastage_cost: Mapped[Decimal] = mapped_column(Numeric)
+    total_production_cost: Mapped[Decimal] = mapped_column(Numeric)
+    profit_margin: Mapped[Decimal] = mapped_column(Numeric)
+    selling_price: Mapped[Decimal] = mapped_column(Numeric)
+    status: Mapped[str] = mapped_column(Text)
+    idempotency_key: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 # ---------------------------------------------------------------- prices
-_FRAME_PRICE = text("SELECT price FROM frame_prices WHERE frame_size = :size AND frame_material = :material")
-_GLASS_PRICE = text("SELECT price FROM glass_prices WHERE frame_size = :size AND glass_type = :glass")
-_LABOUR = text("SELECT labour_cost FROM labour_prices WHERE frame_size = :size")
-
-
 @dataclass(frozen=True)
 class PriceBundle:
     material_price: Decimal
@@ -33,9 +100,12 @@ class PriceBundle:
 
 def fetch_prices(conn: Connection, size: str, material: str, glass: str) -> PriceBundle:
     """Fetch all three prices. Raises PricingNotFound listing EVERY missing item; never guesses."""
-    frame = conn.execute(_FRAME_PRICE, {"size": size, "material": material}).scalar_one_or_none()
-    glass_p = conn.execute(_GLASS_PRICE, {"size": size, "glass": glass}).scalar_one_or_none()
-    labour = conn.execute(_LABOUR, {"size": size}).scalar_one_or_none()
+    frame = conn.execute(select(FramePrice.price).where(
+        FramePrice.frame_size == size, FramePrice.frame_material == material)).scalar_one_or_none()
+    glass_p = conn.execute(select(GlassPrice.price).where(
+        GlassPrice.frame_size == size, GlassPrice.glass_type == glass)).scalar_one_or_none()
+    labour = conn.execute(select(LabourPrice.labour_cost).where(
+        LabourPrice.frame_size == size)).scalar_one_or_none()
 
     missing = [name for name, val in (
         (f"frame price ({size}, {material})", frame),
@@ -49,17 +119,34 @@ def fetch_prices(conn: Connection, size: str, material: str, glass: str) -> Pric
 
 def list_options(conn: Connection) -> dict[str, list[str]]:
     """Options actually priced in the database (used for general questions)."""
-    sizes = conn.execute(text("SELECT frame_size FROM labour_prices ORDER BY frame_size")).scalars().all()
-    materials = conn.execute(text("SELECT DISTINCT frame_material FROM frame_prices ORDER BY 1")).scalars().all()
-    glass = conn.execute(text("SELECT DISTINCT glass_type FROM glass_prices ORDER BY 1")).scalars().all()
+    sizes = conn.execute(select(LabourPrice.frame_size).order_by(LabourPrice.frame_size)).scalars().all()
+    materials = conn.execute(select(FramePrice.frame_material).distinct()
+                             .order_by(FramePrice.frame_material)).scalars().all()
+    glass = conn.execute(select(GlassPrice.glass_type).distinct()
+                         .order_by(GlassPrice.glass_type)).scalars().all()
     return {"frame_size": list(sizes), "frame_material": list(materials), "glass_type": list(glass)}
+
+
+def get_catalog(conn: Connection) -> dict:
+    """Everything the database currently offers, incl. which size+material / size+glass pairs
+    actually have a price row. The single source of truth for validation and for LLM prompts."""
+    frame = [[r[0], r[1]] for r in conn.execute(
+        select(FramePrice.frame_size, FramePrice.frame_material)).all()]
+    glass = [[r[0], r[1]] for r in conn.execute(
+        select(GlassPrice.frame_size, GlassPrice.glass_type)).all()]
+    labour = list(conn.execute(select(LabourPrice.frame_size)).scalars().all())
+    sizes = sorted(set(labour) & {s for s, _ in frame} & {s for s, _ in glass})
+    return {"frame_size": sizes,
+            "frame_material": sorted({m for s, m in frame if s in sizes}),
+            "glass_type": sorted({g for s, g in glass if s in sizes}),
+            "frame_combos": [c for c in frame if c[0] in sizes],
+            "glass_combos": [c for c in glass if c[0] in sizes]}
 
 
 # ---------------------------------------------------------------- customers & threads
 def get_customer_id(conn: Connection, external_id: str) -> int:
     """Map the authenticated user's external id to customers.id."""
-    cid = conn.execute(text("SELECT id FROM customers WHERE external_id = :e"),
-                       {"e": external_id}).scalar_one_or_none()
+    cid = conn.execute(select(Customer.id).where(Customer.external_id == external_id)).scalar_one_or_none()
     if cid is None:
         log.warning("unknown_customer", external_id=external_id)
         raise UnauthorizedAccess("unknown customer")
@@ -68,11 +155,11 @@ def get_customer_id(conn: Connection, external_id: str) -> int:
 
 def claim_or_verify_thread(conn: Connection, thread_id: str, customer_id: int) -> None:
     """First use claims the thread for this customer; later use must match the owner."""
-    conn.execute(text("INSERT INTO conversation_threads (thread_id, customer_id) "
-                      "VALUES (:t, :c) ON CONFLICT (thread_id) DO NOTHING"),
-                 {"t": thread_id, "c": customer_id})
-    owner = conn.execute(text("SELECT customer_id FROM conversation_threads WHERE thread_id = :t"),
-                         {"t": thread_id}).scalar_one()
+    conn.execute(pg_insert(ConversationThread)
+                 .values(thread_id=thread_id, customer_id=customer_id)
+                 .on_conflict_do_nothing(index_elements=[ConversationThread.thread_id]))
+    owner = conn.execute(select(ConversationThread.customer_id)
+                         .where(ConversationThread.thread_id == thread_id)).scalar_one()
     if int(owner) != customer_id:
         log.warning("thread_access_denied", thread_id=thread_id, customer_id=customer_id)
         raise UnauthorizedAccess("thread belongs to another customer")
@@ -99,25 +186,20 @@ class QuotationRecord:
     created_at: datetime
 
 
-_Q_COLS = ("id::text AS id, customer_id, thread_id, original_quotation_id::text AS original_quotation_id, "
-           "revision_number, frame_size, frame_material, glass_type, material_price, glass_price, "
-           "labour_cost, wastage_cost, total_production_cost, profit_margin, selling_price, created_at")
-
-_GET_Q = text(f"SELECT {_Q_COLS} FROM quotations "
-              "WHERE id = CAST(:id AS uuid) AND customer_id = :cid AND status = 'completed'")
-
-_FIND_Q = text(f"SELECT {_Q_COLS} FROM quotations "
-               "WHERE customer_id = :cid AND status = 'completed' "
-               "AND (CAST(:size AS text) IS NULL OR frame_size = :size) "
-               "AND (CAST(:material AS text) IS NULL OR frame_material = :material) "
-               "AND (CAST(:glass AS text) IS NULL OR glass_type = :glass) "
-               "ORDER BY created_at DESC LIMIT :lim")
+_Q_COLS = (Quotation.id, Quotation.customer_id, Quotation.thread_id, Quotation.original_quotation_id,
+           Quotation.revision_number, Quotation.frame_size, Quotation.frame_material,
+           Quotation.glass_type, Quotation.material_price, Quotation.glass_price,
+           Quotation.labour_cost, Quotation.wastage_cost, Quotation.total_production_cost,
+           Quotation.profit_margin, Quotation.selling_price, Quotation.created_at)
 
 
 def get_quotation(conn: Connection, customer_id: int, quotation_id: str) -> QuotationRecord:
     """Owned quotations only. Someone else's id looks identical to a non-existent one."""
+    stmt = select(*_Q_COLS).where(Quotation.id == quotation_id,
+                                  Quotation.customer_id == customer_id,
+                                  Quotation.status == "completed")
     try:
-        row = conn.execute(_GET_Q, {"id": quotation_id, "cid": customer_id}).mappings().first()
+        row = conn.execute(stmt).mappings().first()
     except Exception as exc:  # malformed uuid etc. surfaces as DB error; treat as not found
         if "uuid" in str(exc).lower():
             raise QuotationNotFound(f"invalid id {quotation_id!r}") from exc
@@ -132,9 +214,15 @@ def find_quotations(conn: Connection, customer_id: int, *, size: str | None = No
                     material: str | None = None, glass: str | None = None,
                     limit: int = 5) -> list[QuotationRecord]:
     """Newest first. Filters are optional; an empty result is returned, not raised."""
-    rows = conn.execute(_FIND_Q, {"cid": customer_id, "size": size, "material": material,
-                                  "glass": glass, "lim": limit}).mappings().all()
-    return [QuotationRecord(**r) for r in rows]
+    stmt = select(*_Q_COLS).where(Quotation.customer_id == customer_id, Quotation.status == "completed")
+    if size is not None:
+        stmt = stmt.where(Quotation.frame_size == size)
+    if material is not None:
+        stmt = stmt.where(Quotation.frame_material == material)
+    if glass is not None:
+        stmt = stmt.where(Quotation.glass_type == glass)
+    stmt = stmt.order_by(Quotation.created_at.desc()).limit(limit)
+    return [QuotationRecord(**r) for r in conn.execute(stmt).mappings().all()]
 
 
 @dataclass(frozen=True)
@@ -154,15 +242,6 @@ class NewQuotation:
     original_quotation_id: Optional[str] = None
 
 
-_INSERT_Q = text(
-    "INSERT INTO quotations (customer_id, thread_id, original_quotation_id, revision_number, "
-    "frame_size, frame_material, glass_type, material_price, glass_price, labour_cost, "
-    "wastage_rate, wastage_cost, total_production_cost, profit_margin, selling_price, "
-    "status, idempotency_key) VALUES (:cid, :tid, CAST(:orig AS uuid), :rev, :size, :material, "
-    ":glass, :mp, :gp, :lc, :wr, :wc, :tpc, :pm, :sp, 'completed', :key) "
-    "ON CONFLICT (idempotency_key) DO NOTHING RETURNING id::text")
-
-
 def save_quotation(conn: Connection, q: NewQuotation) -> str:
     """Insert a NEW quotation row (never updates an existing one). Idempotent per key.
 
@@ -174,18 +253,23 @@ def save_quotation(conn: Connection, q: NewQuotation) -> str:
         parent = get_quotation(conn, q.customer_id, q.original_quotation_id)   # ownership check
         revision = parent.revision_number + 1
 
-    new_id = conn.execute(_INSERT_Q, {
-        "cid": q.customer_id, "tid": q.thread_id, "orig": q.original_quotation_id, "rev": revision,
-        "size": q.frame_size, "material": q.frame_material, "glass": q.glass_type,
-        "mp": q.material_price, "gp": q.glass_price, "lc": q.labour_cost,
-        "wr": WASTAGE_RATE, "wc": q.wastage_cost, "tpc": q.total_production_cost,
-        "pm": PROFIT_MARGIN, "sp": q.selling_price, "key": q.idempotency_key,
-    }).scalar_one_or_none()
+    stmt = (pg_insert(Quotation)
+            .values(customer_id=q.customer_id, thread_id=q.thread_id,
+                    original_quotation_id=q.original_quotation_id, revision_number=revision,
+                    frame_size=q.frame_size, frame_material=q.frame_material, glass_type=q.glass_type,
+                    material_price=q.material_price, glass_price=q.glass_price,
+                    labour_cost=q.labour_cost, wastage_rate=WASTAGE_RATE, wastage_cost=q.wastage_cost,
+                    total_production_cost=q.total_production_cost, profit_margin=PROFIT_MARGIN,
+                    selling_price=q.selling_price, status="completed",
+                    idempotency_key=q.idempotency_key)
+            .on_conflict_do_nothing(index_elements=[Quotation.idempotency_key])
+            .returning(Quotation.id))
+    new_id = conn.execute(stmt).scalar_one_or_none()
 
     if new_id is None:   # same key already saved: a retry. Return the existing row (same customer only).
-        new_id = conn.execute(
-            text("SELECT id::text FROM quotations WHERE idempotency_key = :k AND customer_id = :c"),
-            {"k": q.idempotency_key, "c": q.customer_id}).scalar_one_or_none()
+        new_id = conn.execute(select(Quotation.id).where(
+            Quotation.idempotency_key == q.idempotency_key,
+            Quotation.customer_id == q.customer_id)).scalar_one_or_none()
         if new_id is None:
             raise PersistenceError("idempotency key conflict")
         log.info("quotation_save_deduplicated", quotation_id=new_id)

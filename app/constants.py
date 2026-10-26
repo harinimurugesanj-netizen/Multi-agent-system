@@ -12,6 +12,7 @@ ALLOWED: dict[str, tuple[str, ...]] = {
     "glass_type": VALID_GLASS,
 }
 
+MAX_REPAIRS = 2                          # LLM repair passes per customer message
 WASTAGE_RATE = Decimal("0.05")
 PROFIT_MARGIN = Decimal("0.10")          # share of the SELLING price
 MONEY_QUANT = Decimal("0.01")

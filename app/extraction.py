@@ -1,93 +1,99 @@
-"""Stage 2a: Qwen3 requirement extraction with deterministic safety checks.
-
-Qwen3 only PROPOSES values. Python then (1) normalises them and (2) "grounds" them:
-a value is kept only if it can be found in the customer's actual message. This stops the
-model from inventing requirements. Nothing here is pure-LLM trust; no defaults are applied.
+"""LLM-first extraction. Qwen understands typos, synonyms and any wording; Python only checks:
+  1. the model quoted EVIDENCE (exact words) for every value it returns, and those words really
+     appear in the customer's message (so it cannot invent a value from nothing);
+  2. later, the database catalog decides whether the value is actually offered (requirements.py).
+No synonym tables, no spelling rules.
 """
-from __future__ import annotations
-
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
-from app.constants import ALLOWED, REQUIREMENT_FIELDS
+from app.constants import REQUIREMENT_FIELDS
 from config.logging_config import get_logger
+from app.options import options_text
 
 log = get_logger(__name__)
 
 INTENTS = ("new_quotation", "modify_quotation", "retrieve_quotation", "general_question")
 
-MATERIAL_SYNONYMS = {"wood": "wood", "wooden": "wood", "plastic": "plastic",
-                     "metal": "metal", "metallic": "metal"}
-GLASS_SYNONYMS = {"standard": "standard", "standard glass": "standard",
-                  "acrylic": "acrylic", "acrylic glass": "acrylic"}
+FORMAT_HELP = """Each field is null, or an object {"value": <one of our options>, "evidence": <the exact words copied from the customer's message that name it>}."""
 
-_SIZE_RE = re.compile(r"(\d{1,2})\s*(?:x|×|\*|by)\s*(\d{1,2})", re.I)
-_MATERIAL_RE = re.compile(r"\b(wood|wooden|plastic|metal|metallic)\b", re.I)
-_GLASS_RE = re.compile(r"\b(acrylic|standard)\b", re.I)
+RULES = """Rules:
+- Understand typos, synonyms and any wording, and answer with the matching option from our list (for example "woden" -> wood, "4 into 6" -> 4x6).
+- If the customer asks for something that is NOT in our options and is not another way of writing one, put it in "value" exactly as written, so we can tell them it is unavailable.
+- Use only what the customer actually said. If a field is not mentioned, use null. Never guess and never use defaults.
+- "evidence" must be copied exactly (same letters) from the customer's message."""
 
-PROMPT = """
-You extract photo-frame requirements from a customer message. Reply with ONE JSON object only.
+EXTRACT_PROMPT = """
+You extract photo-frame requirements from a customer's message. Reply with ONE JSON object only.
 
-Keys:
-  "intent": one of "new_quotation", "modify_quotation", "retrieve_quotation", "general_question"
-  "frame_size": size the customer stated, e.g. "4x6", or null
-  "frame_material": material the customer stated, or null
-  "glass_type": glass type the customer stated, or null
+Our current options (from the database):
+{options}
 
-Rules:
-- Use null for anything the customer did not clearly state. NEVER guess or default.
-- Copy values as the customer said them. Do not correct or substitute them.
-- Do not invent prices or quotation numbers.
+Return {"frame_size": F, "frame_material": F, "glass_type": F}. """ + FORMAT_HELP + """
+""" + RULES + """
 {context}
 Customer message: {message}
+JSON:"""
+
+REPAIR_PROMPT = """
+You extracted photo-frame requirements from a customer's message, but checking them against our database found problems. Fix your JSON. Reply with ONE JSON object only.
+
+Our current options (from the database):
+{options}
+
+Customer message: {message}
+Your previous JSON: {previous}
+Problems found:
+{problems}
+
+Return {"frame_size": F, "frame_material": F, "glass_type": F}. """ + FORMAT_HELP + """
+""" + RULES + """
+- If a problem is that a field is missing and the customer really did not mention it, keep it null.
 JSON:"""
 
 
 @dataclass
 class ExtractionResult:
-    intent: str = "general_question"
-    fields: dict[str, Optional[str]] = field(default_factory=lambda: {f: None for f in REQUIREMENT_FIELDS})
-    dropped: list[str] = field(default_factory=list)   # fields rejected by the grounding check
+    fields: dict[str, Optional[str]] = field(default_factory=dict)
+    dropped: list[str] = field(default_factory=list)      # fields rejected by the evidence check
 
 
-# ---------- normalisation ----------
-def normalize_size(raw: str) -> str:
-    s = raw.lower().replace("×", "x").replace("*", "x")
-    s = re.sub(r"\b(inches|inch|in)\b|\"", "", s)
-    s = s.replace(" by ", "x")
-    return re.sub(r"\s+", "", s)
+def _norm(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
 
 
-def normalize_value(field_name: str, raw: str) -> str:
-    raw = raw.strip().lower()
-    if field_name == "frame_size":
-        return normalize_size(raw)
-    table = MATERIAL_SYNONYMS if field_name == "frame_material" else GLASS_SYNONYMS
-    return table.get(raw, raw)
+def evidence_ok(evidence: Any, message: str) -> bool:
+    ev = _norm(evidence) if isinstance(evidence, str) else ""
+    return len(ev) >= 2 and ev in _norm(message)
 
 
-def _found_in_text(field_name: str, text: str) -> set[str]:
-    """Allowed canonical values that the customer's text deterministically mentions."""
-    if field_name == "frame_size":
-        return {f"{a}x{b}" for a, b in _SIZE_RE.findall(text)}
-    if field_name == "frame_material":
-        return {MATERIAL_SYNONYMS[m.lower()] for m in _MATERIAL_RE.findall(text)}
-    return {m.lower() for m in _GLASS_RE.findall(text)}
+def clean_value(field_name: str, value: str) -> str:
+    v = value.strip().lower()
+    if field_name == "frame_size":      # only trivial formatting, no word lists
+        v = re.sub(r"\s+|inches$|inch$|in$|\"$", "", v.replace("×", "x").replace("*", "x"))
+    return v
 
 
-def is_grounded(field_name: str, value: str, text: str) -> bool:
-    """True only if `value` is clearly supported by the message and unambiguous."""
-    if value in ALLOWED[field_name]:
-        return _found_in_text(field_name, text) == {value}   # exactly one, and it matches
-    # Not an allowed value: keep it (so we can report it as invalid) only if the customer
-    # literally wrote it.
-    squashed = re.sub(r"\s+", "", normalize_size(text) if field_name == "frame_size" else text.lower())
-    return value.replace(" ", "") in squashed
+def read_fields(group: Any, message: str, label: str) -> tuple[dict[str, str], list[str]]:
+    """Pick {value, evidence} items out of an LLM object; keep only evidence-backed values."""
+    out: dict[str, str] = {}
+    dropped: list[str] = []
+    if not isinstance(group, dict):
+        return out, dropped
+    for f in REQUIREMENT_FIELDS:
+        item = group.get(f)
+        if not isinstance(item, dict) or not isinstance(item.get("value"), str) or not item["value"].strip():
+            continue
+        if evidence_ok(item.get("evidence"), message):
+            out[f] = clean_value(f, item["value"])
+        else:
+            dropped.append(f"{label}.{f}")
+            log.warning("evidence_check_failed", field=f, label=label, value=item["value"])
+    return out, dropped
 
 
-# ---------- LLM output parsing ----------
 def parse_llm_json(content: str) -> dict[str, Any]:
     content = re.sub(r"<think>.*?</think>", "", content or "", flags=re.S)
     match = re.search(r"\{.*\}", content, flags=re.S)
@@ -100,33 +106,35 @@ def parse_llm_json(content: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def extract_from_message(llm, message: str, collected: dict[str, Optional[str]],
-                         asked_fields: list[str]) -> ExtractionResult:
-    """Run qwen on one customer message and return grounded, normalised values."""
+def _run(llm, prompt: str, message: str, label: str) -> ExtractionResult:
+    try:
+        content = llm.invoke(prompt).content
+    except Exception:
+        log.exception("llm_call_failed", label=label)
+        return ExtractionResult()
+    data = parse_llm_json(content)
+    if content and not data:
+        log.warning("llm_output_unparseable", label=label, content=str(content)[:200])
+    fields, dropped = read_fields(data, message, label)
+    log.info("llm_fields_read", label=label, fields=fields, dropped=dropped)
+    return ExtractionResult(fields=fields, dropped=dropped)
+
+
+def extract_from_message(llm, message: str, catalog: Mapping, asked_fields: list[str]) -> ExtractionResult:
+    """Extract requirements from one customer message (e.g. the answer to a question)."""
     context = ""
     if asked_fields:
-        context = ("The assistant just asked the customer about: "
-                   + ", ".join(asked_fields) + ". The message is probably the answer.\n")
-    try:
-        content = llm.invoke(PROMPT.format(context=context, message=message)).content
-    except Exception:  # LLM down / timeout: degrade to "nothing extracted"
-        log.exception("llm_extraction_failed")
-        return ExtractionResult()
+        context = ("The assistant just asked the customer about: " + ", ".join(asked_fields)
+                   + ". The message is probably the answer.\n")
+    prompt = (EXTRACT_PROMPT.replace("{options}", options_text(catalog))
+              .replace("{context}", context).replace("{message}", message))
+    return _run(llm, prompt, message, "extract")
 
-    data = parse_llm_json(content)
-    if not data:
-        log.warning("llm_output_unparseable", content=str(content)[:200])
 
-    result = ExtractionResult(intent=data.get("intent") if data.get("intent") in INTENTS else "general_question")
-    for f in REQUIREMENT_FIELDS:
-        raw = data.get(f)
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        value = normalize_value(f, raw)
-        if is_grounded(f, value, message):
-            result.fields[f] = value
-        else:
-            result.dropped.append(f)
-            log.warning("extraction_not_grounded", field=f, value=value)
-    log.info("extraction_done", intent=result.intent, fields=result.fields, dropped=result.dropped)
-    return result
+def repair_from_message(llm, message: str, current: Mapping[str, Any], problems: list[str],
+                        catalog: Mapping) -> ExtractionResult:
+    """Send the database's validation problems back to the model and let it fix its JSON."""
+    prompt = (REPAIR_PROMPT.replace("{options}", options_text(catalog)).replace("{message}", message)
+              .replace("{previous}", json.dumps({f: current.get(f) for f in REQUIREMENT_FIELDS}))
+              .replace("{problems}", "\n".join(f"- {p}" for p in problems) or "- (none listed)"))
+    return _run(llm, prompt, message, "repair")
