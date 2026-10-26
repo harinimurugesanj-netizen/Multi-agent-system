@@ -1,29 +1,37 @@
+"""One Qwen3 call: intent + requested values + which old quotation is meant (all evidence-checked)."""
 from dataclasses import dataclass, field
+from typing import Mapping
 
-from app.constants import REQUIREMENT_FIELDS
 from app.errors import LLMUnavailable
-from app.extraction import INTENTS, is_grounded, normalize_value, parse_llm_json
+from app.extraction import FORMAT_HELP, INTENTS, RULES, evidence_ok, parse_llm_json, read_fields
 from config.logging_config import get_logger
+from app.options import options_text
 
 log = get_logger(__name__)
 
-PROMPT = """You are the intent router for a photo-frame shop assistant. Reply with ONE JSON object only.
+PROMPT = """
+You are the intent router for a photo-frame shop assistant. Reply with ONE JSON object only.
+
+Our current options (from the database):
+{options}
+
+Return {"intent": I, "reference_latest": R, "requested": G, "reference": G}
 
 "intent" is exactly one of:
   "new_quotation"      customer wants a price/estimate for a new frame
   "modify_quotation"   customer wants to change something in a PREVIOUS quotation
   "retrieve_quotation" customer asks what a previous quotation was, or asks for their quotation history
-  "general_question"   anything else (what sizes/materials/glass do you have, greetings, ...)
-"requested": what the customer WANTS, with keys "frame_size", "frame_material", "glass_type" (null if not stated).
-"reference": only attributes that IDENTIFY which previous quotation they mean (e.g. "my 5x7 wooden one"), same three keys, null if not stated.
-
-Rules: use null unless clearly stated. Never guess or default. Copy values as the customer wrote them.
+  "general_question"   anything else (what options do you have, greetings, ...)
+G is an object {"frame_size": F, "frame_material": F, "glass_type": F}. """ + FORMAT_HELP + """
+"requested" = what the customer WANTS for the frame. "reference" = attributes that only IDENTIFY which previous quotation they mean (for example "my 5x7 wooden one").
+"reference_latest" = null, or the exact words from the message by which the customer points at their most recent quotation (for example "my previous quotation").
+""" + RULES + """
 
 Examples:
-"I need a 4x6 wooden frame" -> {"intent":"new_quotation","requested":{"frame_size":"4x6","frame_material":"wood","glass_type":null},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
-"In my previous quotation, change only the glass to standard" -> {"intent":"modify_quotation","requested":{"frame_size":null,"frame_material":null,"glass_type":"standard"},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
-"What was my 5x7 quotation?" -> {"intent":"retrieve_quotation","requested":{"frame_size":null,"frame_material":null,"glass_type":null},"reference":{"frame_size":"5x7","frame_material":null,"glass_type":null}}
-"What materials do you have?" -> {"intent":"general_question","requested":{"frame_size":null,"frame_material":null,"glass_type":null},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
+"i want a 4 into 6 woden frame with acrilic glass" -> {"intent":"new_quotation","reference_latest":null,"requested":{"frame_size":{"value":"4x6","evidence":"4 into 6"},"frame_material":{"value":"wood","evidence":"woden"},"glass_type":{"value":"acrylic","evidence":"acrilic"}},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
+"In my previous quotation, change only the glass to standard" -> {"intent":"modify_quotation","reference_latest":"my previous quotation","requested":{"frame_size":null,"frame_material":null,"glass_type":{"value":"standard","evidence":"standard"}},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
+"What was my 5x7 quotation?" -> {"intent":"retrieve_quotation","reference_latest":null,"requested":{"frame_size":null,"frame_material":null,"glass_type":null},"reference":{"frame_size":{"value":"5x7","evidence":"5x7"},"frame_material":null,"glass_type":null}}
+"What materials do you have?" -> {"intent":"general_question","reference_latest":null,"requested":{"frame_size":null,"frame_material":null,"glass_type":null},"reference":{"frame_size":null,"frame_material":null,"glass_type":null}}
 
 Customer message: {message}
 JSON:"""
@@ -34,30 +42,15 @@ class Classification:
     intent: str = "general_question"
     requested: dict[str, str] = field(default_factory=dict)
     reference: dict[str, str] = field(default_factory=dict)
+    reference_latest: bool = False
     dropped: list[str] = field(default_factory=list)
 
 
-def _clean(data, text: str, label: str, dropped: list[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    if not isinstance(data, dict):
-        return out
-    for f in REQUIREMENT_FIELDS:
-        raw = data.get(f)
-        if not isinstance(raw, str) or not raw.strip():
-            continue
-        value = normalize_value(f, raw)
-        if is_grounded(f, value, text):
-            out[f] = value
-        else:
-            dropped.append(f"{label}.{f}")
-            log.warning("classification_not_grounded", field=f, label=label, value=value)
-    return out
-
-
-def classify_message(llm, message: str) -> Classification:
+def classify_message(llm, message: str, catalog: Mapping) -> Classification:
     """Raises LLMUnavailable if the model cannot be reached."""
+    prompt = PROMPT.replace("{options}", options_text(catalog)).replace("{message}", message)
     try:
-        content = llm.invoke(PROMPT.replace("{message}", message)).content
+        content = llm.invoke(prompt).content
     except Exception as exc:
         log.exception("llm_classification_failed")
         raise LLMUnavailable(str(exc)[:200]) from exc
@@ -68,8 +61,10 @@ def classify_message(llm, message: str) -> Classification:
         return result
     if data.get("intent") in INTENTS:
         result.intent = data["intent"]
-    result.requested = _clean(data.get("requested"), message, "requested", result.dropped)
-    result.reference = _clean(data.get("reference"), message, "reference", result.dropped)
-    log.info("classified", intent=result.intent, requested=result.requested,
-             reference=result.reference, dropped=result.dropped)
+    result.requested, d1 = read_fields(data.get("requested"), message, "requested")
+    result.reference, d2 = read_fields(data.get("reference"), message, "reference")
+    result.reference_latest = evidence_ok(data.get("reference_latest"), message)
+    result.dropped = d1 + d2
+    log.info("classified", intent=result.intent, requested=result.requested, reference=result.reference,
+             latest=result.reference_latest, dropped=result.dropped)
     return result

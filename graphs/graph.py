@@ -48,8 +48,10 @@ def build_graph(deps, checkpointer, store=None):
     b.add_conditional_edges("apply_requested", route_after_apply, {
         "ask_change_details": "ask_change_details", "validate_requirements": "validate_requirements"})
     b.add_edge("extract_requirements", "validate_requirements")
-    b.add_conditional_edges("validate_requirements", route_after_validation,
-                            {"ask_customer": "ask_customer", "fetch_prices": "fetch_prices"})
+    b.add_conditional_edges("validate_requirements", route_after_validation, {
+        "respond_error": "respond_error", "repair_requirements": "repair_requirements",
+        "ask_customer": "ask_customer", "fetch_prices": "fetch_prices"})
+    b.add_edge("repair_requirements", "validate_requirements")        # re-check the repaired JSON
 
     # pricing -> estimation -> save -> reply (shared by new + modify)
     b.add_conditional_edges("fetch_prices", route_after_price_fetch,

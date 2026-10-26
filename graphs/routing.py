@@ -1,6 +1,7 @@
 """Conditional routing functions. They only READ state and return the next node's name."""
 from typing import Any, Literal, Mapping
 
+from app.constants import MAX_REPAIRS
 from config.logging_config import get_logger
 
 log = get_logger(__name__)
@@ -42,12 +43,20 @@ def route_after_apply(state: State) -> Literal["ask_change_details", "validate_r
     return "validate_requirements"
 
 
-def route_after_validation(state: State) -> Literal["ask_customer", "fetch_prices"]:
+def route_after_validation(state: State) -> Literal["respond_error", "repair_requirements", "ask_customer", "fetch_prices"]:
+    if state.get("error_code"):
+        return "respond_error"
     status = state.get("validation_status")
     if status == "valid":
         return "fetch_prices"
     if status not in ("missing", "invalid"):
         log.warning("unexpected_validation_status", status=status)   # never price on unknown status
+        return "ask_customer"
+    attempts = state.get("repair_attempts", 0)
+    # Send the problems back to the LLM: up to MAX_REPAIRS times for values that are not offered,
+    # and once for fields that are only missing. Then ask the customer.
+    if attempts < MAX_REPAIRS and (state.get("invalid_fields") or attempts == 0):
+        return "repair_requirements"
     return "ask_customer"
 
 
